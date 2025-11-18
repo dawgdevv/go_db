@@ -82,64 +82,60 @@ func (node BNode) nbytes() uint16 {
 
 func nodeLookup(node BNode, key []byte) (uint16, bool) {
 	nkeys := node.nkeys()
-	found := uint16(0)
+	if nkeys == 0 {
+		return 0, false
+	}
 
-	for i := uint16(0); i < nkeys; i++ {
-		cmp := bytes.Compare(node.getKey(i), key)
-
-		if cmp <= 0 {
-			found = i
-		}
-
-		if cmp >= 0 {
-			break
+	// binary search over sorted keys
+	lo, hi := uint16(0), nkeys
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		cmp := bytes.Compare(node.getKey(mid), key)
+		if cmp < 0 {
+			lo = mid + 1
+		} else if cmp > 0 {
+			hi = mid
+		} else {
+			return mid, true
 		}
 	}
 
-	// Check outside the loop
-	if found < nkeys {
-		cmp := bytes.Compare(node.getKey(found), key)
-		if cmp == 0 {
-			return found, true
-		}
-	}
-
-	return found, false
+	// lo is first index where key would be inserted
+	// for leaf nodes: insertion position
+	// for internal nodes: child pointer to follow
+	return lo, false
 }
 
 func nodeAppendKv(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
 	new.setPtr(idx, ptr) /// set the pointer
 
-	pos := new.kvPos(idx) /// calculate the position to write the kv
-
-	binary.LittleEndian.PutUint16(new[pos:pos+2], uint16(len(key))) //write key length
-
-	copy(new[pos+2:], key) //write key
-
-	binary.LittleEndian.PutUint16(new[pos+2+uint16(len(key)):pos+4+uint16(len(key))], uint16(len(val))) //write value length
-
-	copy(new[pos+4+uint16(len(key)):], val) //write value
-
-	///update offset for next kv
-	if idx < new.nkeys()-1 {
-		new.setOffset(idx+1, new.getOffset(idx)+4+uint16(len(key))+uint16(len(val)))
+	// compute start position for this KV based on previous offset or zero
+	var offset uint16
+	if idx == 0 {
+		offset = 0
+	} else {
+		prevPos := new.kvPos(idx - 1)
+		prevKeyLen := binary.LittleEndian.Uint16(new[prevPos : prevPos+2])
+		prevValLen := binary.LittleEndian.Uint16(new[prevPos+2+prevKeyLen : prevPos+4+prevKeyLen])
+		offset = new.getOffset(idx-1) + 4 + prevKeyLen + prevValLen
 	}
+
+	new.setOffset(idx, offset)
+	pos := new.kvPos(idx)
+
+	binary.LittleEndian.PutUint16(new[pos:pos+2], uint16(len(key)))                                     // write key length
+	copy(new[pos+2:], key)                                                                              // write key
+	binary.LittleEndian.PutUint16(new[pos+2+uint16(len(key)):pos+4+uint16(len(key))], uint16(len(val))) // write value length
+	copy(new[pos+4+uint16(len(key)):], val)                                                             // write value
 }
 
 func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
-	//// Copy pointers
+	// copy pointers and recompute offsets/KVs one by one to avoid layout corruption
 	for i := uint16(0); i < n; i++ {
-		new.setPtr(dstNew+i, old.getPtr(srcOld+i))
+		ptr := old.getPtr(srcOld + i)
+		key := old.getKey(srcOld + i)
+		val := old.getVal(srcOld + i)
+		new.setHeader(old.btype(), dstNew+i+1) // ensure nkeys reflects appended keys progressively
+		nodeAppendKv(new, dstNew+i, ptr, key, val)
 	}
-
-	//// Copy offsets
-	for i := uint16(0); i < n; i++ {
-		new.setOffset(dstNew+i, old.getOffset(srcOld+i))
-	}
-
-	//// Copy KV data in bulk
-	srcBegin := old.kvPos(srcOld)
-	srcEnd := old.kvPos(srcOld + n)
-	dstBegin := new.kvPos(dstNew)
-	copy(new[dstBegin:], old[srcBegin:srcEnd])
 }
