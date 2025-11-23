@@ -33,34 +33,48 @@ func (node BNode) setHeader(btype uint16, nkeys uint16) {
 }
 
 //// pointer array access
+// For internal nodes: nkeys keys and nkeys+1 child pointers (indices 0..nkeys)
+// For leaf nodes: nkeys keys and nkeys dummy pointers (unused, always 0)
 
 func (node BNode) getPtr(idx uint16) uint64 {
 	pos := 4 + 8*idx
 	return binary.LittleEndian.Uint64(node[pos : pos+8])
 }
+
 func (node BNode) setPtr(idx uint16, val uint64) {
 	pos := 4 + 8*idx
 	binary.LittleEndian.PutUint64(node[pos:pos+8], val)
+}
+
+// ptrSlots returns the number of pointer slots needed
+func (node BNode) ptrSlots() uint16 {
+	if node.btype() == BNODE_INTERNAL {
+		return node.nkeys() + 1 // internal nodes have nkeys+1 children
+	}
+	return node.nkeys() // leaf nodes have nkeys entries (pointers unused)
 }
 
 //// offset array access
 
 func (node BNode) getOffset(idx uint16) uint16 {
 	if idx == 0 {
+		// For the first key we treat offset as 0; it is implicit
 		return 0
 	}
-
-	pos := 4 + 8*node.nkeys() + 2*(idx-1)
+	ptrSlots := node.ptrSlots()
+	pos := 4 + 8*ptrSlots + 2*(idx-1)
 	return binary.LittleEndian.Uint16(node[pos : pos+2])
-
 }
+
 func (node BNode) setOffset(idx uint16, val uint16) {
-	pos := 4 + 8*node.nkeys() + 2*(idx-1)
+	ptrSlots := node.ptrSlots()
+	pos := 4 + 8*ptrSlots + 2*(idx-1)
 	binary.LittleEndian.PutUint16(node[pos:pos+2], val)
 }
 
 func (node BNode) kvPos(idx uint16) uint16 {
-	return 4 + 8*node.nkeys() + 2*node.nkeys() + node.getOffset(idx)
+	ptrSlots := node.ptrSlots()
+	return 4 + 8*ptrSlots + 2*node.nkeys() + node.getOffset(idx)
 }
 
 func (node BNode) getKey(idx uint16) []byte {
@@ -77,7 +91,16 @@ func (node BNode) getVal(idx uint16) []byte {
 }
 
 func (node BNode) nbytes() uint16 {
-	return node.kvPos(node.nkeys())
+	ptrSlots := node.ptrSlots()
+	if node.nkeys() == 0 {
+		return 4 + 8*ptrSlots + 2*node.nkeys()
+	}
+	// total bytes = header + pointers + offsets + last kv offset + last kv size
+	lastIdx := node.nkeys() - 1
+	lastPos := node.kvPos(lastIdx)
+	keyLen := binary.LittleEndian.Uint16(node[lastPos : lastPos+2])
+	valLen := binary.LittleEndian.Uint16(node[lastPos+2+keyLen : lastPos+4+keyLen])
+	return lastPos + 4 + keyLen + valLen
 }
 
 func nodeLookup(node BNode, key []byte) (uint16, bool) {
@@ -106,22 +129,26 @@ func nodeLookup(node BNode, key []byte) (uint16, bool) {
 	return lo, false
 }
 
-func nodeAppendKv(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
-	new.setPtr(idx, ptr) /// set the pointer
+// leafAppendKv appends a key-value pair to a leaf node at the given index.
+// For leaf nodes, ptr is unused (always 0).
+func leafAppendKv(new BNode, idx uint16, key []byte, val []byte) {
+	assert(new.btype() == BNODE_LEAF)
+	new.setPtr(idx, 0) // leaf nodes don't use pointers
 
-	// compute start position for this KV based on previous offset or zero
+	// compute start position for this KV based on previous kv end
 	var offset uint16
 	if idx == 0 {
 		offset = 0
 	} else {
-		prevPos := new.kvPos(idx - 1)
+		prevOffset := new.getOffset(idx - 1)
+		prevPos := 4 + 8*new.ptrSlots() + 2*new.nkeys() + prevOffset
 		prevKeyLen := binary.LittleEndian.Uint16(new[prevPos : prevPos+2])
 		prevValLen := binary.LittleEndian.Uint16(new[prevPos+2+prevKeyLen : prevPos+4+prevKeyLen])
-		offset = new.getOffset(idx-1) + 4 + prevKeyLen + prevValLen
+		offset = prevOffset + 4 + prevKeyLen + prevValLen
 	}
 
 	new.setOffset(idx, offset)
-	pos := new.kvPos(idx)
+	pos := 4 + 8*new.ptrSlots() + 2*new.nkeys() + offset
 
 	binary.LittleEndian.PutUint16(new[pos:pos+2], uint16(len(key)))                                     // write key length
 	copy(new[pos+2:], key)                                                                              // write key
@@ -129,13 +156,52 @@ func nodeAppendKv(new BNode, idx uint16, ptr uint64, key []byte, val []byte) {
 	copy(new[pos+4+uint16(len(key)):], val)                                                             // write value
 }
 
-func nodeAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
-	// copy pointers and recompute offsets/KVs one by one to avoid layout corruption
+// internalAppendKv appends a separator key to an internal node at the given index.
+// For internal nodes, values are always empty (nil).
+func internalAppendKv(new BNode, idx uint16, key []byte) {
+	assert(new.btype() == BNODE_INTERNAL)
+
+	// compute start position for this KV based on previous kv end
+	var offset uint16
+	if idx == 0 {
+		offset = 0
+	} else {
+		prevOffset := new.getOffset(idx - 1)
+		prevPos := 4 + 8*new.ptrSlots() + 2*new.nkeys() + prevOffset
+		prevKeyLen := binary.LittleEndian.Uint16(new[prevPos : prevPos+2])
+		offset = prevOffset + 4 + prevKeyLen // no value for internal nodes
+	}
+
+	new.setOffset(idx, offset)
+	pos := 4 + 8*new.ptrSlots() + 2*new.nkeys() + offset
+
+	binary.LittleEndian.PutUint16(new[pos:pos+2], uint16(len(key))) // write key length
+	copy(new[pos+2:], key)                                          // write key
+	binary.LittleEndian.PutUint16(new[pos+2+uint16(len(key)):], 0)  // write zero value length
+}
+
+func leafAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
+	// Caller must have set the final header (btype and nkeys) on "new"
+	// before calling this function. Here we just copy data sequentially.
+	assert(new.btype() == BNODE_LEAF && old.btype() == BNODE_LEAF)
 	for i := uint16(0); i < n; i++ {
-		ptr := old.getPtr(srcOld + i)
 		key := old.getKey(srcOld + i)
 		val := old.getVal(srcOld + i)
-		new.setHeader(old.btype(), dstNew+i+1) // ensure nkeys reflects appended keys progressively
-		nodeAppendKv(new, dstNew+i, ptr, key, val)
+		leafAppendKv(new, dstNew+i, key, val)
 	}
+}
+
+func internalAppendRange(new BNode, old BNode, dstNew uint16, srcOld uint16, n uint16) {
+	// Copy child pointers and separator keys from old internal node to new.
+	// Caller must have set the final header (btype and nkeys) on "new".
+	assert(new.btype() == BNODE_INTERNAL && old.btype() == BNODE_INTERNAL)
+	for i := uint16(0); i < n; i++ {
+		// Copy child pointer at srcOld+i to dstNew+i
+		new.setPtr(dstNew+i, old.getPtr(srcOld+i))
+		// Copy separator key
+		key := old.getKey(srcOld + i)
+		internalAppendKv(new, dstNew+i, key)
+	}
+	// Copy the last child pointer (at srcOld+n)
+	new.setPtr(dstNew+n, old.getPtr(srcOld+n))
 }

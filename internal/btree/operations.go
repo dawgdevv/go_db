@@ -19,7 +19,13 @@ func nodeSplit2(left BNode, right BNode, old BNode) {
 	calcRightBytes := func(split uint16) uint16 {
 		nright := old.nkeys() - split
 		kvDataSize := old.nbytes() - old.kvPos(split)
-		return 4 + 8*nright + 2*nright + kvDataSize
+		// For internal nodes: nright keys, nright+1 pointers
+		// For leaf nodes: nright keys, nright pointers (unused)
+		ptrSlots := nright
+		if old.btype() == BNODE_INTERNAL {
+			ptrSlots = nright + 1
+		}
+		return 4 + 8*ptrSlots + 2*nright + kvDataSize
 	}
 
 	// Adjust split point to ensure right node fits in page
@@ -30,11 +36,17 @@ func nodeSplit2(left BNode, right BNode, old BNode) {
 	assert(nleft < old.nkeys())
 	nright := old.nkeys() - nleft
 
-	// Set headers and copy data
+	// Set headers once with final key counts and copy data
 	left.setHeader(old.btype(), nleft)
 	right.setHeader(old.btype(), nright)
-	nodeAppendRange(left, old, 0, 0, nleft)
-	nodeAppendRange(right, old, 0, nleft, nright)
+
+	if old.btype() == BNODE_LEAF {
+		leafAppendRange(left, old, 0, 0, nleft)
+		leafAppendRange(right, old, 0, nleft, nright)
+	} else {
+		internalAppendRange(left, old, 0, 0, nleft)
+		internalAppendRange(right, old, 0, nleft, nright)
+	}
 
 	assert(right.nbytes() <= BTREE_PAGE_SIZE)
 }
@@ -65,26 +77,37 @@ func nodeMerge(target BNode, left BNode, right BNode) {
 	assert(left.btype() == right.btype())
 
 	nkeys := left.nkeys() + right.nkeys()
-	assert(nkeys <= 65535)
 
 	target.setHeader(left.btype(), nkeys)
 
-	nodeAppendRange(target, left, 0, 0, left.nkeys())
-	nodeAppendRange(target, right, left.nkeys(), 0, right.nkeys())
+	if left.btype() == BNODE_LEAF {
+		leafAppendRange(target, left, 0, 0, left.nkeys())
+		leafAppendRange(target, right, left.nkeys(), 0, right.nkeys())
+	} else {
+		internalAppendRange(target, left, 0, 0, left.nkeys())
+		internalAppendRange(target, right, left.nkeys(), 0, right.nkeys())
+	}
 
 	assert(target.nbytes() <= BTREE_PAGE_SIZE)
 }
 
-func nodeReplace2kid(new BNode, old BNode, idx uint16, ptr uint64, key []byte) {
+func nodeReplace2kid(new BNode, old BNode, idx uint16, ptr0 uint64, key1 []byte, ptr1 uint64) {
 	assert(old.btype() == BNODE_INTERNAL)
 	assert(idx < old.nkeys())
 
 	new.setHeader(BNODE_INTERNAL, old.nkeys()+1)
 
-	nodeAppendRange(new, old, 0, 0, idx)
-	nodeAppendKv(new, idx, ptr, key, nil)
-	nodeAppendKv(new, idx+1, old.getPtr(idx), old.getKey(idx), nil)
+	// Copy keys/children before idx
+	internalAppendRange(new, old, 0, 0, idx)
+
+	// Insert two new children
+	new.setPtr(idx, ptr0)
+	internalAppendKv(new, idx, key1)
+	new.setPtr(idx+1, ptr1)
+	internalAppendKv(new, idx+1, old.getKey(idx))
+
+	// Copy remaining keys/children after idx
 	if idx+1 < old.nkeys() {
-		nodeAppendRange(new, old, idx+2, idx+1, old.nkeys()-(idx+1))
+		internalAppendRange(new, old, idx+2, idx+1, old.nkeys()-(idx+1))
 	}
 }

@@ -63,15 +63,6 @@ func newTestBTree() (*BTree, *testPager) {
 
 // TestBTreeInsertSingle tests inserting one key-value pair into an empty tree
 func TestBTreeInsertSingle(t *testing.T) {
-	// TODO: Let's implement this together!
-	// What should we do first?
-	// 1. Create a new tree
-	// 2. Insert one key-value pair
-	// 3. Check that root was created
-	// 4. Check that it's a leaf node
-	// 5. Check that it has 1 key
-	// 6. Verify the key and value are correct
-
 	tree, pager := newTestBTree()
 	key := []byte("nishant")
 	val := []byte("goodboy")
@@ -102,8 +93,6 @@ func TestBTreeInsertSingle(t *testing.T) {
 	if string(gotVal) != "goodboy" {
 		t.Fatalf("expected value %q,but got %q ", "goodboy", string(gotVal))
 	}
-
-	t.Skip("TODO: Implement together")
 }
 
 // ============================================================================
@@ -112,12 +101,6 @@ func TestBTreeInsertSingle(t *testing.T) {
 
 // TestBTreeUpdate tests updating an existing key with a new value
 func TestBTreeUpdate(t *testing.T) {
-	// TODO: Let's implement this together!
-	// What should happen when we insert the same key twice?
-	// 1. Insert key="foo", value="bar"
-	// 2. Insert key="foo", value="baz" (update)
-	// 3. Check that we still have only 1 key (not 2)
-	// 4. Check that the value is the new one ("baz")
 	tree, pager := newTestBTree()
 
 	key := []byte("apple")
@@ -137,8 +120,6 @@ func TestBTreeUpdate(t *testing.T) {
 	if string(gotVal) != "green" {
 		t.Fatalf("expected value %q after update ,but got %q", "green", string(gotVal))
 	}
-
-	t.Skip("TODO: Implement together")
 }
 
 // ============================================================================
@@ -147,13 +128,33 @@ func TestBTreeUpdate(t *testing.T) {
 
 // TestBTreeMultipleInserts tests inserting multiple keys and verifies they're sorted
 func TestBTreeMultipleInserts(t *testing.T) {
-	// TODO: Let's implement this together!
-	// If we insert keys out of order, they should be stored sorted
-	// 1. Insert: "zebra", "apple", "mango", "banana"
-	// 2. Check we have 4 keys
-	// 3. Verify they're in sorted order: "apple", "banana", "mango", "zebra"
+	tree, pager := newTestBTree()
 
-	t.Skip("TODO: Implement together")
+	keys := [][]byte{
+		[]byte("zebra"),
+		[]byte("apple"),
+		[]byte("mango"),
+		[]byte("banana"),
+	}
+
+	for _, key := range keys {
+		tree.Insert(key, []byte{})
+	}
+
+	rootNode := BNode(pager.Get(tree.root))
+
+	if rootNode.nkeys() != 4 {
+		t.Fatalf("expected 4 keys,but got %d keys", rootNode.nkeys())
+	}
+
+	expectedOrder := []string{"apple", "banana", "mango", "zebra"}
+
+	for i, expectedKey := range expectedOrder {
+		gotKey := rootNode.getKey(uint16(i))
+		if string(gotKey) != expectedKey {
+			t.Fatalf("at index %d, expected key %q,but got %q", i, expectedKey, string(gotKey))
+		}
+	}
 }
 
 // ============================================================================
@@ -162,12 +163,51 @@ func TestBTreeMultipleInserts(t *testing.T) {
 
 // TestBTreeSplit tests that inserting many keys causes node splits
 func TestBTreeSplit(t *testing.T) {
-	// TODO: Let's implement this together!
-	// When we insert enough keys, the leaf should split and create an internal root
-	// 1. Insert 100+ keys (small keys/values)
-	// 2. Check that root becomes INTERNAL (not LEAF anymore)
-	// 3. Check that root has multiple children
-	// 4. Verify all keys across all nodes are sorted
+	tree, pager := newTestBTree()
 
-	t.Skip("TODO: Implement together")
+	// Insert enough keys to trigger a split (need > 178 keys with "key###" + "val" format)
+	for i := 0; i < 200; i++ {
+		key := []byte(fmt.Sprintf("key%03d", i))
+		val := []byte("val")
+		tree.Insert(key, val)
+	}
+
+	rootNode := BNode(pager.Get(tree.root))
+
+	if rootNode.btype() != BNODE_INTERNAL {
+		t.Fatalf("expected root to be INTERNAL after splits, but got type %d", rootNode.btype())
+	}
+
+	if rootNode.nkeys() < 1 {
+		t.Fatalf("expected root to have at least 1 key after splits, but got %d keys", rootNode.nkeys())
+	}
+	// Verify all keys are sorted across the tree
+	var allKeys []string
+
+	var collectKeys func(nodeID uint64)
+	collectKeys = func(nodeID uint64) {
+		node := BNode(pager.Get(nodeID))
+		if node.btype() == BNODE_LEAF {
+			for i := uint16(0); i < node.nkeys(); i++ {
+				allKeys = append(allKeys, string(node.getKey(i)))
+			}
+		} else {
+			for i := uint16(0); i < node.nkeys(); i++ {
+				childPtr := node.getPtr(i)
+				collectKeys(uint64(childPtr))
+				allKeys = append(allKeys, string(node.getKey(i)))
+			}
+			// Collect keys from the last child
+			childPtr := node.getPtr(node.nkeys())
+			collectKeys(uint64(childPtr))
+		}
+	}
+
+	collectKeys(tree.root)
+
+	for i := 1; i < len(allKeys); i++ {
+		if allKeys[i-1] > allKeys[i] {
+			t.Fatalf("keys are not sorted: %q came before %q", allKeys[i-1], allKeys[i])
+		}
+	}
 }
